@@ -1,49 +1,71 @@
 import axios from 'axios'
+import useSWR, { SWRResponse } from 'swr'
+import { Dispatch, Fragment, SetStateAction, useState } from 'react'
 import AwesomeDebouncePromise from 'awesome-debounce-promise'
 import { useAsync } from 'react-async-hook'
 import useConstant from 'use-constant'
-import { FontAwesomeIcon } from '@fortawesome/react-fontawesome'
+import { useTranslation } from 'next-i18next'
 
-import { Dispatch, FC, Fragment, SetStateAction, useState } from 'react'
-import { Dialog, Transition } from '@headlessui/react'
 import Link from 'next/link'
+import { FontAwesomeIcon } from '@fortawesome/react-fontawesome'
+import { Dialog, Transition } from '@headlessui/react'
 
-import { OdSearchResult } from '../types'
-import { getFileIcon } from '../utils/getFileIcon'
-import siteConfig from '../config/site.json'
+import type { OdDriveItem, OdSearchResult } from '../types'
 import { LoadingIcon } from './Loading'
 
+import { getFileIcon } from '../utils/getFileIcon'
+import { fetcher } from '../utils/fetchWithSWR'
+import siteConfig from '../config/site.config'
+
+/**
+ * Extract the searched item's path in field 'parentReference' and convert it to the
+ * absolute path represented in onedrive-vercel-index
+ *
+ * @param path Path returned from the parentReference field of the driveItem
+ * @returns The absolute path of the driveItem in the search result
+ */
+function mapAbsolutePath(path: string): string {
+  // path is in the format of '/drive/root:/path/to/file', if baseDirectory is '/' then we split on 'root:',
+  // otherwise we split on the user defined 'baseDirectory'
+  const absolutePath = path.split(siteConfig.baseDirectory === '/' ? 'root:' : siteConfig.baseDirectory)[1]
+  // path returned by the API may contain #, by doing a decodeURIComponent and then encodeURIComponent we can
+  // replace URL sensitive characters such as the # with %23
+  return absolutePath
+    .split('/')
+    .map(p => encodeURIComponent(decodeURIComponent(p)))
+    .join('/')
+}
+
+/**
+ * Implements a debounced search function that returns a promise that resolves to an array of
+ * search results.
+ *
+ * @returns A react hook for a debounced async search of the drive
+ */
 function useDriveItemSearch() {
   const [query, setQuery] = useState('')
   const searchDriveItem = async (q: string) => {
-    const { data } = await axios.get<OdSearchResult>(`/api/search?q=${q}`)
-
-    // Extract the searched item's path and convert it to the absolute path in onedrive-vercel-index
-    function mapAbsolutePath(path: string): string {
-      return siteConfig.baseDirectory === '/' ? path.split('root:')[1] : path.split(siteConfig.baseDirectory)[1]
-    }
+    const { data } = await axios.get<OdSearchResult>(`/api/search/?q=${q}`)
 
     // Map parentReference to the absolute path of the search result
     data.map(item => {
-      // TODO: supporting sharepoint search where the path is not returned in parentReference
-      if ('path' in item.parentReference) {
-        item['path'] = `${mapAbsolutePath(item.parentReference.path)}/${encodeURIComponent(item.name)}`
-      } else {
-        throw Error(
-          'We currently only support search in OneDrive international. SharePoint instances are not supported yet. See issue: https://github.com/spencerwooo/onedrive-vercel-index/issues/299'
-        )
-      }
+      item['path'] =
+        'path' in item.parentReference
+          ? // OneDrive International have the path returned in the parentReference field
+            `${mapAbsolutePath(item.parentReference.path)}/${encodeURIComponent(item.name)}`
+          : // OneDrive for Business/Education does not, so we need extra steps here
+            ''
     })
 
     return data
   }
 
-  const debouncedNotionSearch = useConstant(() => AwesomeDebouncePromise(searchDriveItem, 1000))
+  const debouncedDriveItemSearch = useConstant(() => AwesomeDebouncePromise(searchDriveItem, 1000))
   const results = useAsync(async () => {
     if (query.length === 0) {
       return []
     } else {
-      return debouncedNotionSearch(query)
+      return debouncedDriveItemSearch(query)
     }
   }, [query])
 
@@ -54,21 +76,108 @@ function useDriveItemSearch() {
   }
 }
 
-function SearchModal({
+function SearchResultItemTemplate({
+  driveItem,
+  driveItemPath,
+  itemDescription,
+  disabled,
+}: {
+  driveItem: OdSearchResult[number]
+  driveItemPath: string
+  itemDescription: string
+  disabled: boolean
+}) {
+  return (
+    <Link href={driveItemPath} passHref>
+      <a
+        className={`flex items-center space-x-4 border-b border-gray-400/30 px-4 py-1.5 hover:bg-gray-50 dark:hover:bg-gray-850 ${
+          disabled ? 'pointer-events-none cursor-not-allowed' : 'cursor-pointer'
+        }`}
+      >
+        <FontAwesomeIcon icon={driveItem.file ? getFileIcon(driveItem.name) : ['far', 'folder']} />
+        <div>
+          <div className="text-sm font-medium leading-8">{driveItem.name}</div>
+          <div
+            className={`overflow-hidden truncate font-mono text-xs opacity-60 ${
+              itemDescription === 'Loading ...' && 'animate-pulse'
+            }`}
+          >
+            {itemDescription}
+          </div>
+        </div>
+      </a>
+    </Link>
+  )
+}
+
+function SearchResultItemLoadRemote({ result }: { result: OdSearchResult[number] }) {
+  const { data, error }: SWRResponse<OdDriveItem, string> = useSWR(`/api/item/?id=${result.id}`, fetcher)
+
+  const { t } = useTranslation()
+
+  if (error) {
+    return <SearchResultItemTemplate driveItem={result} driveItemPath={''} itemDescription={error} disabled={true} />
+  }
+  if (!data) {
+    return (
+      <SearchResultItemTemplate
+        driveItem={result}
+        driveItemPath={''}
+        itemDescription={t('Loading ...')}
+        disabled={true}
+      />
+    )
+  }
+
+  const driveItemPath = `${mapAbsolutePath(data.parentReference.path)}/${encodeURIComponent(data.name)}`
+  return (
+    <SearchResultItemTemplate
+      driveItem={result}
+      driveItemPath={driveItemPath}
+      itemDescription={decodeURIComponent(driveItemPath)}
+      disabled={false}
+    />
+  )
+}
+
+function SearchResultItem({ result }: { result: OdSearchResult[number] }) {
+  if (result.path === '') {
+    // path is empty, which means we need to fetch the parentReference to get the path
+    return <SearchResultItemLoadRemote result={result} />
+  } else {
+    // path is not an empty string in the search result, such that we can directly render the component as is
+    const driveItemPath = decodeURIComponent(result.path)
+    return (
+      <SearchResultItemTemplate
+        driveItem={result}
+        driveItemPath={result.path}
+        itemDescription={driveItemPath}
+        disabled={false}
+      />
+    )
+  }
+}
+
+export default function SearchModal({
   searchOpen,
   setSearchOpen,
 }: {
   searchOpen: boolean
   setSearchOpen: Dispatch<SetStateAction<boolean>>
 }) {
-  const closeSearchBox = () => setSearchOpen(false)
-
   const { query, setQuery, results } = useDriveItemSearch()
+
+  const { t } = useTranslation()
+
+  const closeSearchBox = () => {
+    setSearchOpen(false)
+    setQuery('')
+  }
 
   return (
     <Transition appear show={searchOpen} as={Fragment}>
-      <Dialog as="div" className="inset-0 z-[200] fixed overflow-y-auto" onClose={closeSearchBox}>
-        <div className="min-h-screen text-center px-4">
+      <Dialog as="div" className="fixed inset-0 z-[200] overflow-y-auto" onClose={closeSearchBox}>
+        <div className="min-h-screen px-4 text-center">
           <Transition.Child
             as={Fragment}
             enter="ease-out duration-100"
@@ -78,7 +187,7 @@ function SearchModal({
             leaveFrom="opacity-100"
             leaveTo="opacity-0"
           >
-            <Dialog.Overlay className="bg-white/80 inset-0 fixed dark:bg-gray-800/80" />
+            <Dialog.Overlay className="fixed inset-0 bg-white/80 dark:bg-gray-800/80" />
           </Transition.Child>
 
           <Transition.Child
@@ -90,54 +199,43 @@ function SearchModal({
             leaveFrom="opacity-100 scale-100"
             leaveTo="opacity-0 scale-95"
           >
-            <div className="border rounded border-gray-400/30 shadow-xl my-12 text-left w-full max-w-3xl transform transition-all inline-block overflow-hidden">
+            <div className="my-12 inline-block w-full max-w-3xl transform overflow-hidden rounded border border-gray-400/30 text-left shadow-xl transition-all">
               <Dialog.Title
                 as="h3"
-                className="flex items-center space-x-4 dark:text-white border-b bg-gray-50 border-gray-400/30 p-4 dark:bg-gray-800"
+                className="flex items-center space-x-4 border-b border-gray-400/30 bg-gray-50 p-4 dark:bg-gray-800 dark:text-white"
               >
-                <FontAwesomeIcon icon="search" className="w-4 h-4" />
+                <FontAwesomeIcon icon="search" className="h-4 w-4" />
                 <input
                   type="text"
                   id="search-box"
                   className="w-full bg-transparent focus:outline-none focus-visible:outline-none"
-                  placeholder="Search ..."
+                  placeholder={t('Search ...')}
                   value={query}
                   onChange={e => setQuery(e.target.value)}
                 />
-                <div className="px-2 py-1 rounded-lg bg-gray-100 dark:bg-gray-700 font-medium text-xs">ESC</div>
+                <div className="rounded-lg bg-gray-200 px-2 py-1 text-xs font-medium dark:bg-gray-700">ESC</div>
               </Dialog.Title>
-
-              <div className="bg-white dark:text-white dark:bg-gray-900 max-h-[80vh] overflow-x-hidden overflow-y-scroll">
+              <div
+                className="max-h-[80vh] overflow-x-hidden overflow-y-scroll bg-white dark:bg-gray-900 dark:text-white"
+                onClick={closeSearchBox}
+              >
                 {results.loading && (
-                  <div className="text-center px-4 py-12 text-sm font-medium">
-                    <LoadingIcon className="animate-spin w-4 h-4 mr-2 inline-block svg-inline--fa" />
-                    <span>Loading ...</span>
+                  <div className="px-4 py-12 text-center text-sm font-medium">
+                    <LoadingIcon className="svg-inline--fa mr-2 inline-block h-4 w-4 animate-spin" />
+                    <span>{t('Loading ...')}</span>
                   </div>
                 )}
                 {results.error && (
-                  <div className="text-center px-4 py-12 text-sm font-medium">Error: {results.error.message}</div>
+                  <div className="px-4 py-12 text-center text-sm font-medium">
+                    {t('Error: {{message}}', { message: results.error.message })}
+                  </div>
                 )}
                 {results.result && (
                   <>
                     {results.result.length === 0 ? (
-                      <div className="text-center px-4 py-12 text-sm font-medium">Nothing here.</div>
+                      <div className="px-4 py-12 text-center text-sm font-medium">{t('Nothing here.')}</div>
                     ) : (
-                      results.result.map(result => (
-                        <Link href={result.path} key={result.id} passHref>
-                          <div
-                            className="flex items-center space-x-4 border-b cursor-pointer border-gray-400/30 px-4 py-1.5 hover:bg-gray-50 dark:hover:bg-gray-850"
-                            onClick={closeSearchBox}
-                          >
-                            <FontAwesomeIcon icon={result.file ? getFileIcon(result.name) : ['far', 'folder']} />
-                            <div>
-                              <div className="text-sm font-medium leading-8">{result.name}</div>
-                              <div className="text-xs font-mono opacity-60 truncate overflow-hidden">
-                                {decodeURIComponent(result.path)}
-                              </div>
-                            </div>
-                          </div>
-                        </Link>
-                      ))
+                      results.result.map(result => <SearchResultItem key={result.id} result={result} />)
                     )}
                   </>
                 )}
@@ -149,5 +247,3 @@ function SearchModal({
     </Transition>
   )
 }
-
-export default SearchModal
